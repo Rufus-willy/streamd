@@ -158,10 +158,267 @@ def prepare_gaussian_files(file_template, file_out, ncpu, opt_restart=False, gau
         output.write(new_data)
 
 
+def find_sobtop_dir(explicit_path=None):
+    """Locate the Sobtop installation directory.
+
+    Search order: explicit argument > SOBTOP_DIR env var > project sobtop/sobtop_*/ glob.
+    Returns the directory path or None if not found.
+    """
+    def _is_sobtop_dir(d):
+        return os.path.isfile(os.path.join(d, 'sobtop'))
+
+    if explicit_path and os.path.isdir(explicit_path) and _is_sobtop_dir(explicit_path):
+        return explicit_path
+
+    env_dir = os.environ.get('SOBTOP_DIR')
+    if env_dir and os.path.isdir(env_dir) and _is_sobtop_dir(env_dir):
+        return env_dir
+
+    project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    for d in sorted(glob(os.path.join(project_root, 'sobtop', 'sobtop_*'))):
+        if _is_sobtop_dir(d):
+            return d
+
+    return None
+
+
+def _convert_mol2_types_to_elements(mol2_path, output_path, rdkit_mol):
+    """Replace GAFF atom types with element symbols in a mol2 file.
+
+    Sobtop requires element symbols (C, H, O) in the atom type column,
+    but antechamber outputs GAFF types (ca, ha, o). This conversion uses
+    the RDKit mol to supply correct element symbols while preserving charges.
+    """
+    elements = [atom.GetSymbol() for atom in rdkit_mol.GetAtoms()]
+    with open(mol2_path) as f:
+        lines = f.readlines()
+
+    in_atoms = False
+    atom_idx = 0
+    result = []
+    for line in lines:
+        s = line.strip()
+        if s.startswith('@<TRIPOS>ATOM'):
+            in_atoms = True
+            result.append(line)
+            continue
+        elif s.startswith('@<TRIPOS>'):
+            in_atoms = False
+            result.append(line)
+            continue
+        if in_atoms and s and atom_idx < len(elements):
+            parts = line.split()
+            if len(parts) >= 6:
+                parts[5] = elements[atom_idx]
+                result.append(' '.join(parts) + '\n')
+                atom_idx += 1
+                continue
+        result.append(line)
+
+    with open(output_path, 'w') as f:
+        f.writelines(result)
+
+
+def inject_charges_to_itp(itp_path, mol2_path):
+    """Read charges from a mol2 file and inject them into an itp file.
+
+    Parses the @<TRIPOS>ATOM section of the mol2 (column 9 = charge) and
+    replaces the charge column (column 7) in the [ atoms ] section of the itp.
+    Raises ValueError if atom counts do not match.
+    """
+    # Read charges from mol2
+    charges = []
+    with open(mol2_path) as f:
+        in_atoms = False
+        for line in f:
+            s = line.strip()
+            if s.startswith('@<TRIPOS>ATOM'):
+                in_atoms = True
+                continue
+            elif s.startswith('@<TRIPOS>'):
+                in_atoms = False
+                continue
+            if in_atoms and s:
+                parts = line.split()
+                if len(parts) >= 9:
+                    charges.append(float(parts[8]))
+
+    # Read and modify itp
+    with open(itp_path) as f:
+        lines = f.readlines()
+
+    in_atom_section = False
+    atom_idx = 0
+    result = []
+    for line in lines:
+        stripped = line.strip()
+        if stripped == '[ atoms ]':
+            in_atom_section = True
+            result.append(line)
+            continue
+        elif stripped.startswith('[') and stripped.endswith(']'):
+            in_atom_section = False
+            result.append(line)
+            continue
+
+        if in_atom_section and stripped and not stripped.startswith(';'):
+            parts = line.split()
+            if len(parts) >= 7:
+                if atom_idx < len(charges):
+                    parts[6] = f'{charges[atom_idx]:.8f}'
+                result.append(' '.join(parts) + '\n')
+                atom_idx += 1
+                continue
+
+        result.append(line)
+
+    if atom_idx != len(charges):
+        raise ValueError(
+            f'Atom count mismatch: mol2 has {len(charges)} atoms, '
+            f'itp [ atoms ] has {atom_idx} atoms')
+
+    with open(itp_path, 'w') as f:
+        f.writelines(result)
+
+
+def prep_ligand_sobtop(mol_tuple, script_path, wdir_ligand, bash_log,
+                       sobtop_dir, charge_method='gasteiger', ncpu=1,
+                       no_dr=False, mol2_file=None, env=None):
+    """Prepare ligand topology using Sobtop as the parameterization backend.
+
+    Generates {molid}.itp, posre_{molid}.itp, {molid}.gro, and resid.txt
+    with the same output interface as prep_ligand().
+    """
+    mol, molid, resid = mol_tuple
+    wdir_ligand_cur = os.path.abspath(os.path.join(wdir_ligand, molid))
+    os.makedirs(wdir_ligand_cur, exist_ok=True)
+
+    itp_path = os.path.join(wdir_ligand_cur, f'{molid}.itp')
+    posre_path = os.path.join(wdir_ligand_cur, f'posre_{molid}.itp')
+
+    # Skip if already done
+    if os.path.isfile(itp_path) and os.path.isfile(posre_path):
+        logging.warning(
+            f'{molid}.itp and posre_{molid}.itp already exist. '
+            f'Sobtop preparation will be skipped for {molid}.')
+        if not os.path.isfile(os.path.join(wdir_ligand_cur, 'resid.txt')):
+            with open(os.path.join(wdir_ligand_cur, 'resid.txt'), 'w') as out:
+                out.write(f'{molid}\t{resid}\n')
+        return wdir_ligand_cur
+
+    # Map charge method to antechamber -c flag
+    ac_charge = 'gas' if charge_method == 'gasteiger' else 'bcc'
+
+    mol2_path = os.path.join(wdir_ligand_cur, f'{molid}.mol2')
+
+    if not mol2_file or not os.path.isfile(mol2_file):
+        mol_file = os.path.join(wdir_ligand_cur, f'{molid}.mol')
+        mol = Chem.AddHs(mol, addCoords=True)
+        mol = reorder_hydrogens(mol)
+        Chem.MolToMolFile(mol, mol_file)
+        charge = rdmolops.GetFormalCharge(mol)
+
+        # Generate mol2 with charges via antechamber
+        cmd = (f'charge_method={ac_charge} lfile={mol_file} '
+               f'input_dirname={wdir_ligand_cur} resid={resid} '
+               f'molid={molid} charge={charge} dr=yes '
+               f'bash {os.path.join(script_path, "script_sh", "ligand_mol2prep.sh")} '
+               f'>> {os.path.join(wdir_ligand_cur, bash_log)} 2>&1')
+
+        success = run_check_subprocess(
+            cmd, molid, log=os.path.join(wdir_ligand_cur, bash_log), env=env,
+            ignore_error=True if (no_dr or ac_charge == 'bcc') else False)
+
+        if not success:
+            if ac_charge == 'bcc':
+                logging.warning(
+                    f'AM1-BCC charge calculation failed for {molid}. '
+                    f'Falling back to Gasteiger charges.')
+                ac_charge = 'gas'
+                cmd = (f'charge_method={ac_charge} lfile={mol_file} '
+                       f'input_dirname={wdir_ligand_cur} resid={resid} '
+                       f'molid={molid} charge={charge} dr=yes '
+                       f'bash {os.path.join(script_path, "script_sh", "ligand_mol2prep.sh")} '
+                       f'>> {os.path.join(wdir_ligand_cur, bash_log)} 2>&1')
+                success = run_check_subprocess(
+                    cmd, molid, log=os.path.join(wdir_ligand_cur, bash_log), env=env,
+                    ignore_error=True if no_dr else False)
+
+            if not success and not no_dr:
+                return None
+            elif not success:
+                logging.warning(
+                    f'antechamber failed for {molid} with dr=yes. Retrying with dr=no.')
+                cmd = (f'charge_method={ac_charge} lfile={mol_file} '
+                       f'input_dirname={wdir_ligand_cur} resid={resid} '
+                       f'molid={molid} charge={charge} dr=no '
+                       f'bash {os.path.join(script_path, "script_sh", "ligand_mol2prep.sh")} '
+                       f'>> {os.path.join(wdir_ligand_cur, bash_log)} 2>&1')
+                if not run_check_subprocess(
+                        cmd, molid, log=os.path.join(wdir_ligand_cur, bash_log), env=env):
+                    return None
+
+        # Convert GAFF types to element symbols for Sobtop
+        _convert_mol2_types_to_elements(mol2_path, mol2_path, mol)
+    else:
+        mol2 = pmd.load_file(mol2_file).to_structure()
+        mol2.residues[0].name = 'UNL'
+        mol2.save(mol2_path)
+        logging.info(f'Using provided mol2 file: {mol2_file}')
+        mol = mol2.rdkit_mol
+        _convert_mol2_types_to_elements(mol2_path, mol2_path, mol)
+
+    # Run Sobtop to generate topology and coordinates
+    cmd = (f'input_dirname={wdir_ligand_cur} molid={molid} '
+           f'sobtop_dir={sobtop_dir} nthreads=1 '
+           f'bash {os.path.join(script_path, "script_sh", "ligand_sobtop.sh")} '
+           f'>> {os.path.join(wdir_ligand_cur, bash_log)} 2>&1')
+    if not run_check_subprocess(
+            cmd, molid, log=os.path.join(wdir_ligand_cur, bash_log), env=env):
+        return None
+
+    # Inject charges from mol2 into itp (Sobtop writes zero charges)
+    inject_charges_to_itp(itp_path, mol2_path)
+
+    # Fix moleculetype and residue names: Sobtop uses the mol2 molecule name and
+    # "MOL" as residue name, but downstream expects the resid (e.g. UNL) everywhere
+    with open(itp_path) as f:
+        itp_data = f.read()
+    itp_data = re.sub(
+        r'(\[ moleculetype \]\n;[^\n]*\n)' + re.escape(molid) + r'(\s+)',
+        rf'\g<1>{resid}\g<2>', itp_data, count=1)
+    itp_data = itp_data.replace(' MOL ', f' {resid} ')
+    with open(itp_path, 'w') as f:
+        f.write(itp_data)
+
+    # Fix residue name in gro: Sobtop always writes "MOL", but downstream
+    # expects the resid (e.g. UNL) for index group naming
+    gro_path = os.path.join(wdir_ligand_cur, f'{molid}.gro')
+    with open(gro_path) as f:
+        gro_lines = f.readlines()
+    for i in range(2, len(gro_lines) - 1):
+        if len(gro_lines[i]) > 10 and 'MOL' in gro_lines[i][5:10]:
+            gro_lines[i] = gro_lines[i][:5] + f'{resid:<5s}' + gro_lines[i][10:]
+    with open(gro_path, 'w') as f:
+        f.writelines(gro_lines)
+
+    # Verify outputs
+    for f in [itp_path, posre_path, gro_path]:
+        if not os.path.isfile(f):
+            logging.error(f'Expected file not found after Sobtop run: {f}')
+            return None
+
+    with open(os.path.join(wdir_ligand_cur, 'resid.txt'), 'w') as out:
+        out.write(f'{molid}\t{resid}\n')
+
+    return wdir_ligand_cur
+
+
 def prep_ligand(mol_tuple, script_path, project_dir, wdir_ligand,
                 conda_env_path, bash_log, gaussian_exe=None,  no_dr=False,
                 activate_gaussian=None, gaussian_basis='B3LYP/6-31G*', gaussian_memory='60GB', ncpu=1,
-                mol2_file=None, env=None):
+                mol2_file=None, env=None,
+                ligand_backend='ambertools', sobtop_dir=None, ligand_charge_method='gasteiger'):
     """Prepare force-field parameters and conformers for a single ligand."""
     mol, molid, resid = mol_tuple
 
@@ -178,6 +435,13 @@ def prep_ligand(mol_tuple, script_path, project_dir, wdir_ligand,
                 out.write(f'{molid}\t{resid}\n')
 
         return wdir_ligand_cur
+
+    if ligand_backend == 'sobtop':
+        return prep_ligand_sobtop(
+            mol_tuple, script_path=script_path, wdir_ligand=wdir_ligand,
+            bash_log=bash_log, sobtop_dir=sobtop_dir,
+            charge_method=ligand_charge_method, ncpu=ncpu, no_dr=no_dr,
+            mol2_file=mol2_file, env=env)
 
     if not mol2_file or not os.path.isfile(mol2_file):
         mol2_file = os.path.join(wdir_ligand_cur, f'{molid}.mol2')
@@ -248,7 +512,8 @@ def prep_ligand(mol_tuple, script_path, project_dir, wdir_ligand,
 
 def prepare_input_ligands(ligand_fname, preset_resid, protein_resid_set, script_path, project_dir, wdir_ligand,
                           no_dr, gaussian_exe, activate_gaussian, gaussian_basis, gaussian_memory,
-                          hostfile, ncpu, bash_log):
+                          hostfile, ncpu, bash_log,
+                          ligand_backend='ambertools', sobtop_dir=None, ligand_charge_method='gasteiger'):
     """Prepare parameterization inputs for multiple ligands.
      :param ligand_fname:
     :param preset_resid:
@@ -271,7 +536,9 @@ def prepare_input_ligands(ligand_fname, preset_resid, protein_resid_set, script_
             project_dir=project_dir, wdir_ligand=wdir_ligand,
             conda_env_path=os.environ["CONDA_PREFIX"],
             ncpu = ncpu, mol2_file = ligand_fname,
-            bash_log=bash_log, env = os.environ.copy())
+            bash_log=bash_log, env = os.environ.copy(),
+            ligand_backend=ligand_backend, sobtop_dir=sobtop_dir,
+            ligand_charge_method=ligand_charge_method)
 
         if res:
             lig_wdirs.append(res)
@@ -284,6 +551,11 @@ def prepare_input_ligands(ligand_fname, preset_resid, protein_resid_set, script_
                 boron_containing_mols.append(mol_tuple)
             else:
                 standard_mols.append(mol_tuple)
+
+        # Sobtop backend handles all elements including boron without Gaussian
+        if ligand_backend == 'sobtop' and boron_containing_mols:
+            standard_mols.extend(boron_containing_mols)
+            boron_containing_mols = []
 
         dask_client, cluster = None, None
         # prepare boron-containig mols
@@ -300,7 +572,9 @@ def prepare_input_ligands(ligand_fname, preset_resid, protein_resid_set, script_
                                          gaussian_exe=gaussian_exe, activate_gaussian=activate_gaussian,
                                          gaussian_basis=gaussian_basis, gaussian_memory=gaussian_memory,
                                          ncpu=ncpu, bash_log=bash_log, no_dr=no_dr,
-                                         env=os.environ.copy()):
+                                         env=os.environ.copy(),
+                                         ligand_backend=ligand_backend, sobtop_dir=sobtop_dir,
+                                         ligand_charge_method=ligand_charge_method):
                         if res:
                             lig_wdirs.append(res)
                 finally:
@@ -324,7 +598,9 @@ def prepare_input_ligands(ligand_fname, preset_resid, protein_resid_set, script_
                                      wdir_ligand=wdir_ligand, no_dr=no_dr,
                                      conda_env_path=os.environ["CONDA_PREFIX"],
                                      ncpu=ncpu, bash_log=bash_log,
-                                     env=os.environ.copy()):
+                                     env=os.environ.copy(),
+                                     ligand_backend=ligand_backend, sobtop_dir=sobtop_dir,
+                                     ligand_charge_method=ligand_charge_method):
                     if res:
                         lig_wdirs.append(res)
             finally:

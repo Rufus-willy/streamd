@@ -26,7 +26,7 @@ import re
 from streamd.analysis.md_system_analysis import run_md_analysis
 from streamd.analysis.run_analysis import run_rmsd_analysis
 from streamd.preparation.complex_preparation import run_complex_preparation
-from streamd.preparation.ligand_preparation import prepare_input_ligands, check_mols
+from streamd.preparation.ligand_preparation import prepare_input_ligands, check_mols, find_sobtop_dir
 from streamd.utils.dask_init import init_dask_cluster, calc_dask
 from streamd.preparation.md_files_preparation import edit_mdp, copy_missing
 from streamd.utils.utils import (
@@ -334,7 +334,8 @@ def start(protein, wdir, lfile, system_lfile, noignh, no_dr,
           explicit_args=(), mdp_dir=None, bash_log=None,
           box_type='cubic', box_padding_nm=1.0,
           salt_concentration=None, ion_pname='NA', ion_nname='CL',
-          water_model='tip3p'):
+          water_model='tip3p',
+          ligand_backend='ambertools', sobtop_dir=None, ligand_charge_method='gasteiger'):
     """Run StreaMD pipeline.
 
     :param protein: Protein file in PDB or GRO format.
@@ -392,6 +393,15 @@ def start(protein, wdir, lfile, system_lfile, noignh, no_dr,
     project_dir = os.path.dirname(os.path.abspath(__file__))
     script_path = os.path.join(project_dir, 'scripts')
     script_mdp_path = os.path.join(script_path, 'mdp')
+
+    # Detect Sobtop directory if Sobtop backend is selected
+    if ligand_backend == 'sobtop':
+        sobtop_dir = find_sobtop_dir(sobtop_dir)
+        if sobtop_dir is None:
+            logging.exception('Sobtop backend selected but Sobtop directory not found. '
+                              'Use --sobtop_dir or set SOBTOP_DIR environment variable.')
+            return None
+        logging.info(f'Using Sobtop from: {sobtop_dir}')
 
     wdir_md = os.path.join(wdir, 'md_files', 'md_run')
     prep_root = os.path.join(wdir, 'md_files', 'md_preparation', 'systems')
@@ -499,7 +509,9 @@ def start(protein, wdir, lfile, system_lfile, noignh, no_dr,
                                                          project_dir=project_dir, wdir_ligand=wdir_system_ligand, no_dr=no_dr,
                                                          gaussian_exe=gaussian_exe, activate_gaussian=activate_gaussian,
                                                          gaussian_basis=gaussian_basis, gaussian_memory=gaussian_memory,
-                                                         hostfile=hostfile, ncpu=ncpu, bash_log=bash_log)
+                                                         hostfile=hostfile, ncpu=ncpu, bash_log=bash_log,
+                                                         ligand_backend=ligand_backend, sobtop_dir=sobtop_dir,
+                                                         ligand_charge_method=ligand_charge_method)
                 if number_of_mols != len(system_lig_wdirs):
                     logging.exception(f'Error with the cofactor preparation. Only {len(system_lig_wdirs)} from {number_of_mols} preparation were finished.'
                                       f' The calculation will be interrupted')
@@ -520,7 +532,9 @@ def start(protein, wdir, lfile, system_lfile, noignh, no_dr,
                                                       project_dir=project_dir, wdir_ligand=wdir_ligand, no_dr=no_dr,
                                                       gaussian_exe=gaussian_exe, activate_gaussian=activate_gaussian,
                                                       gaussian_basis=gaussian_basis, gaussian_memory=gaussian_memory,
-                                                      hostfile=hostfile, ncpu=ncpu, bash_log=bash_log)
+                                                      hostfile=hostfile, ncpu=ncpu, bash_log=bash_log,
+                                                      ligand_backend=ligand_backend, sobtop_dir=sobtop_dir,
+                                                      ligand_charge_method=ligand_charge_method)
                 if number_of_mols != len(var_lig_wdirs):
                     logging.warning(f'Problem with the ligand preparation. Only {len(var_lig_wdirs)} from {number_of_mols} preparation were finished.'
                                     f' Such molecules will be skipped.')
@@ -849,6 +863,14 @@ def main():
                          help='Turn off the acdoctor mode and do not check/diagnose problems in the input ligand file '
                               'in the next attempt if the regular antechamber run for ligand preparation fails (ligand_mol2prep.sh script related issues). '
                               'Use this argument carefully and ensure that you provide valid structures')
+    parser1.add_argument('--ligand_backend', choices=['ambertools', 'sobtop'], default='ambertools',
+                        help='Backend for ligand parameterization. "ambertools" (default) uses antechamber+tleap+ParmED. '
+                             '"sobtop" uses Sobtop with prebuilt GAFF parameters (better for aromatic/large molecules)')
+    parser1.add_argument('--sobtop_dir', default=None,
+                        help='Path to Sobtop installation directory. If not specified, auto-detected from SOBTOP_DIR env var or project sobtop/ folder')
+    parser1.add_argument('--ligand_charge_method', choices=['gasteiger', 'bcc'], default='gasteiger',
+                        help='Charge method for Sobtop backend. "gasteiger" (default) is fast and never fails. '
+                             '"bcc" uses AM1-BCC (higher accuracy but may fail for aromatic molecules; falls back to gasteiger on failure)')
     parser1.add_argument('--not_clean_backup_files', action='store_true', default=False,
                         help='Not to remove all backups of md files')
     parser1.add_argument('--steps', default=None, nargs='*', type=int,
@@ -1018,6 +1040,9 @@ def main():
               salt_concentration=args.salt_concentration,
               ion_pname=args.ion_pname,
               ion_nname=args.ion_nname,
-              water_model=args.water_model)
+              water_model=args.water_model,
+              ligand_backend=args.ligand_backend,
+              sobtop_dir=args.sobtop_dir,
+              ligand_charge_method=args.ligand_charge_method)
     finally:
         logging.shutdown()
