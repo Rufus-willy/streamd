@@ -28,6 +28,7 @@ setuptools.setup(
     python_requires='>=3.6',
     extras_require={
         'rdkit': ['rdkit>=2017.09'],
+        'pdbfixer': ['pdbfixer'],
     },
     entry_points={'console_scripts':
                       ['run_md = streamd.run_md:main',

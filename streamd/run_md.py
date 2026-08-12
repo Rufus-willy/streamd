@@ -335,7 +335,8 @@ def start(protein, wdir, lfile, system_lfile, noignh, no_dr,
           box_type='cubic', box_padding_nm=1.0,
           salt_concentration=None, ion_pname='NA', ion_nname='CL',
           water_model='tip3p',
-          ligand_backend='ambertools', sobtop_dir=None, ligand_charge_method='gasteiger'):
+          ligand_backend='ambertools', sobtop_dir=None, ligand_charge_method='gasteiger',
+          no_fix_protein=False):
     """Run StreaMD pipeline.
 
     :param protein: Protein file in PDB or GRO format.
@@ -388,6 +389,7 @@ def start(protein, wdir, lfile, system_lfile, noignh, no_dr,
     :param ion_pname: Positive ion name passed to ``gmx genion -pname``. Default: NA.
     :param ion_nname: Negative ion name passed to ``gmx genion -nname``. Default: CL.
     :param water_model: Water model passed to ``gmx pdb2gmx -water``. Default: tip3p.
+    :param no_fix_protein: If True, skip auto-fixing missing heavy atoms via pdbfixer.
     :return: ``None``.
     """
     project_dir = os.path.dirname(os.path.abspath(__file__))
@@ -462,6 +464,18 @@ def start(protein, wdir, lfile, system_lfile, noignh, no_dr,
                         logging.info('Start protein preparation')
                         logging.info(
                             f'Water model: {water_model}')
+
+                        # 自动修复缺失重原子
+                        if not no_fix_protein and p_ext == '.pdb':
+                            from streamd.utils.protein_fixer import fix_missing_atoms
+                            fixed_pdb = os.path.join(wdir_protein, f'{pname}_fixed.pdb')
+                            try:
+                                was_fixed, missing_info = fix_missing_atoms(protein, fixed_pdb)
+                                if was_fixed:
+                                    protein = fixed_pdb
+                            except ImportError:
+                                logging.warning('pdbfixer 未安装，跳过蛋白缺失原子修复。'
+                                               '建议安装: pip install pdbfixer')
 
                         cmd = f'gmx pdb2gmx -f {protein} -o {os.path.join(wdir_protein, pname)}.gro -water {water_model} {"-ignh" if not noignh else "-noignh"} ' \
                               f'-i {os.path.join(wdir_protein, "posre.itp")} ' \
@@ -836,6 +850,9 @@ def main():
                               "(the correct protonation states must be provided by user) and ignores the original hydrogens."
                               " If the --noignh argument is used, the original hydrogen atoms will be preserved during the preparation,"
                               " although there may be problems with recognition of atom names by GROMACS.")
+    parser1.add_argument('--no_fix_protein', action='store_true',
+                        help='Do not auto-fix missing heavy atoms in protein PDB via pdbfixer. '
+                             'By default, streamd fixes missing atoms before gmx pdb2gmx.')
     parser1.add_argument('--md_time', metavar='ns', required=False, default=1, type=float,
                         help='Time of MD simulation in ns. Default: 1 ns.')
     parser1.add_argument('--npt_time', metavar='ps', required=False, default=1000, type=int,
@@ -1043,6 +1060,7 @@ def main():
               water_model=args.water_model,
               ligand_backend=args.ligand_backend,
               sobtop_dir=args.sobtop_dir,
-              ligand_charge_method=args.ligand_charge_method)
+              ligand_charge_method=args.ligand_charge_method,
+              no_fix_protein=args.no_fix_protein)
     finally:
         logging.shutdown()

@@ -10,7 +10,7 @@ import re
 import parmed as pmd
 
 from rdkit import Chem
-from rdkit.Chem import rdmolops
+from rdkit.Chem import AllChem, rdmolops
 
 from streamd.utils.dask_init import init_dask_cluster, calc_dask
 from streamd.utils.utils import run_check_subprocess
@@ -25,6 +25,35 @@ def reorder_hydrogens(mol):
                 if neighbor.GetAtomicNum() == 1:  # Is a hydrogen
                     new_order.append(neighbor.GetIdx())
     mol = rdmolops.RenumberAtoms(mol, new_order)
+    return mol
+
+def fix_zero_coordinate_hydrogens(mol):
+    """检测并修复坐标为 (0,0,0) 的原子（典型为 AddHs 后坐标缺失的氢原子）。
+
+    若检测到零坐标原子，用 ETKDG 重新嵌入 3D 构象并做 MMFF 最小化。
+    """
+    if mol.GetNumConformers() == 0:
+        return mol
+    conf = mol.GetConformer()
+    zero_atoms = []
+    for atom in mol.GetAtoms():
+        pos = conf.GetAtomPosition(atom.GetIdx())
+        if abs(pos.x) < 1e-6 and abs(pos.y) < 1e-6 and abs(pos.z) < 1e-6:
+            zero_atoms.append(atom.GetIdx())
+    if not zero_atoms:
+        return mol
+    logging.warning(
+        f'检测到 {len(zero_atoms)} 个零坐标原子，正在用 ETKDG 重新生成 3D 构象')
+    # 整分子重嵌入（coordMap 固定重原子方案在距离约束冲突时会失败）
+    if AllChem.EmbedMolecule(mol, randomSeed=42, useRandomCoords=True) != 0:
+        logging.error('ETKDG EmbedMolecule 失败，无法修复零坐标原子')
+        return mol
+    # MMFF 最小化
+    props = AllChem.MMFFGetMoleculeProperties(mol)
+    if props is not None:
+        ff = AllChem.MMFFGetMoleculeForceField(mol, props)
+        if ff is not None:
+            ff.Minimize(maxIts=2000)
     return mol
 
 def supply_mols_tuple(fname, preset_resid=None, protein_resid_set=None):
@@ -315,6 +344,7 @@ def prep_ligand_sobtop(mol_tuple, script_path, wdir_ligand, bash_log,
         mol_file = os.path.join(wdir_ligand_cur, f'{molid}.mol')
         mol = Chem.AddHs(mol, addCoords=True)
         mol = reorder_hydrogens(mol)
+        mol = fix_zero_coordinate_hydrogens(mol)
         Chem.MolToMolFile(mol, mol_file)
         charge = rdmolops.GetFormalCharge(mol)
 
@@ -450,6 +480,7 @@ def prep_ligand(mol_tuple, script_path, project_dir, wdir_ligand,
         mol = Chem.AddHs(mol, addCoords=True)
         # reorder hydrogens for Gromacs GPU update functionality
         mol = reorder_hydrogens(mol)
+        mol = fix_zero_coordinate_hydrogens(mol)
 
         Chem.MolToMolFile(mol, mol_file)
 
